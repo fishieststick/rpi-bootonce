@@ -24,7 +24,7 @@ The tool is intentionally verbose by default. It prints what it is doing, which 
 * Raspberry Pi 4
 * Raspberry Pi Compute Module 4
 
-Raspberry Pi 4 and Compute Module 4 do not support the same clean Pi 5 style one-time boot order override used by this tool.
+Raspberry Pi 4 and Compute Module 4 do not support the same clean Raspberry Pi 5 style one-time boot order override used by this tool.
 
 ## Install from GitHub Release
 
@@ -75,6 +75,86 @@ sudo bootonce makeimage usb         Image USB storage
 sudo bootonce makeimage nvme        Image NVMe storage
 sudo bootonce makeimage pishrink    Shrink an existing .img with PiShrink
 ```
+
+## Raspberry Pi Connect support
+
+`bootonce connect` prepares an offline Raspberry Pi OS installation for Raspberry Pi Connect.
+
+This is useful when you are booted into a recovery OS and want to prepare another OS installation, for example an eMMC installation or USB recovery installation, before booting into it.
+
+`bootonce connect` can configure:
+
+* hostname
+* Raspberry Pi Connect auth key
+* DHCP or static network configuration
+* optional VLAN configuration
+
+The command can be started interactively:
+
+```bash
+sudo bootonce connect
+```
+
+Or with a target:
+
+```bash
+sudo bootonce connect emmc
+sudo bootonce connect usb
+sudo bootonce connect nvme
+sudo bootonce connect sd
+```
+
+If no target is provided, `bootonce` asks which detected OS installation should be configured.
+
+## Raspberry Pi Connect auth keys
+
+A Raspberry Pi Connect auth key is a temporary key used to link a Raspberry Pi device to a Raspberry Pi Connect account without manually opening the browser sign-in flow on that device.
+
+Important behavior:
+
+* auth keys are single-use
+* personal auth keys expire after 6 hours
+* organisation auth keys can expire between 1 and 90 days
+* personal accounts can only have one active auth key at a time
+* each device or prepared OS install needs its own unused auth key
+* the target Raspberry Pi must boot and reach the internet before the key expires
+
+Because of this, generate the auth key shortly before running `bootonce connect`.
+
+## How to create a Raspberry Pi Connect auth key
+
+1. Open Raspberry Pi Connect in your browser.
+2. Sign in with your Raspberry Pi ID.
+3. Open the account menu or settings area.
+4. For a personal account, go to the Settings tab.
+5. Find the Auth keys section.
+6. Select Create new auth key.
+7. Copy the generated key.
+8. Paste it into `bootonce connect` when asked.
+
+The key usually starts with something like:
+
+```text
+rpuak_
+```
+
+Organisation keys may use a different prefix.
+
+When `bootonce connect` asks for the auth key, the input is intentionally visible. This makes it easier for a technician to verify that the copied key is complete. The key is still redacted in logs and summaries.
+
+## How `bootonce connect` uses the auth key
+
+Raspberry Pi Connect can automatically detect an auth key if it is saved inside the target user profile at:
+
+```text
+.config/com.raspberrypi.connect/auth.key
+```
+
+`bootonce connect` prepares the selected offline OS so that Raspberry Pi Connect can consume the auth key when that OS is booted.
+
+After the target OS boots and reaches the internet, Raspberry Pi Connect exchanges the auth key for a persistent sign-in token. The original auth key is then no longer reusable.
+
+If the target OS does not boot and connect to the internet before the auth key expires, create a new auth key and run `bootonce connect` again.
 
 ## Typical workflow
 
