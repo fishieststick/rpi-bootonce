@@ -1,0 +1,1001 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="1.3.0"
+LOG_FILE="/var/log/rpi-boot-once.log"
+MOUNTPOINT="/mnt/rpi-boot-once-target"
+DEFAULT_TARGET_ROOT="/dev/mmcblk0p2"
+MAILBOX_TAG="0x0003808b"
+USB_ORDER="0xf14"
+NVME_ORDER="0xf16"
+USB_STRICT_ORDER="0xe4"
+NVME_STRICT_ORDER="0xe6"
+
+QUIET=0
+YES=0
+DRY_RUN=0
+TARGET_ROOT="$DEFAULT_TARGET_ROOT"
+TARGET_USER=""
+CONNECT_KEY=""
+BOOT_TARGET=""
+ACTION=""
+RESTORE_ITEM=""
+VERBOSE_PREFIX=1
+
+PROGRAM_NAME="$(basename "$0")"
+
+init_log() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/rpi-boot-once.log"
+  else
+    LOG_FILE="/tmp/rpi-boot-once.log"
+    touch "$LOG_FILE" 2>/dev/null || true
+  fi
+}
+
+_timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
+
+log_line() {
+  local level="$1"; shift
+  local msg="$*"
+  printf '%s [%s] %s\n' "$(_timestamp)" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+say() {
+  local level="$1"; shift
+  local msg="$*"
+  log_line "$level" "$msg"
+  if [[ "$QUIET" -eq 0 ]]; then
+    printf '[%s] %s\n' "$level" "$msg"
+  fi
+}
+
+error() {
+  local msg="$*"
+  log_line "ERROR" "$msg"
+  printf '[ERROR] %s\n' "$msg" >&2
+}
+
+warn() {
+  local msg="$*"
+  log_line "WARN" "$msg"
+  if [[ "$QUIET" -eq 0 ]]; then
+    printf '[WARN] %s\n' "$msg" >&2
+  fi
+}
+
+ok() { say "OK" "$*"; }
+info() { say "INFO" "$*"; }
+dry() { say "DRY-RUN" "$*"; }
+cmd_note() { say "CMD" "$*"; }
+path_note() { say "PATH" "$*"; }
+
+redact_key() {
+  local key="$1"
+  local len=${#key}
+  if [[ $len -le 12 ]]; then
+    printf '***redacted***'
+  else
+    printf '%s...redacted...%s' "${key:0:8}" "${key: -4}"
+  fi
+}
+
+run_cmd() {
+  if [[ $# -lt 1 ]]; then
+    error "run_cmd called without a command"
+    return 2
+  fi
+  cmd_note "$*"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    dry "Would run command above"
+    return 0
+  fi
+
+  local status=0
+  if [[ "$QUIET" -eq 0 ]]; then
+    set +e
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+    status=${PIPESTATUS[0]}
+    set -e
+  else
+    set +e
+    "$@" >> "$LOG_FILE" 2>&1
+    status=$?
+    set -e
+  fi
+
+  if [[ $status -ne 0 ]]; then
+    error "Command failed with exit code $status: $*"
+    return "$status"
+  fi
+  ok "Command succeeded: $*"
+  return 0
+}
+
+write_file() {
+  local path="$1"
+  local content="$2"
+  path_note "$path"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    dry "Would write file: $path"
+    return 0
+  fi
+  printf '%s' "$content" > "$path"
+  ok "Wrote file: $path"
+}
+
+append_file() {
+  local path="$1"
+  local content="$2"
+  path_note "$path"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    dry "Would append to file: $path"
+    return 0
+  fi
+  printf '%s' "$content" >> "$path"
+  ok "Appended to file: $path"
+}
+
+confirm() {
+  local prompt="$1"
+  if [[ "$YES" -eq 1 ]]; then
+    info "Auto-confirmed because --yes was used: $prompt"
+    return 0
+  fi
+  local answer=""
+  printf '%s [y/N]: ' "$prompt"
+  read -r answer || true
+  case "$answer" in
+    y|Y|yes|YES|Yes) return 0 ;;
+    *) error "Aborted by user"; exit 1 ;;
+  esac
+}
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    error "Root privileges are required. Run this command with sudo."
+    exit 1
+  fi
+}
+
+usage_bootonce() {
+  cat <<'USAGE'
+rpi-boot-once - Raspberry Pi 5 / CM5 one-time boot override and recovery helper
+
+Usage:
+  bootonce status
+  bootonce doctor
+  bootonce usb on [--dry-run] [--yes] [--quiet]
+  bootonce usb now [--dry-run] [--yes] [--quiet]
+  bootonce nvme on [--dry-run] [--yes] [--quiet]
+  bootonce nvme now [--dry-run] [--yes] [--quiet]
+
+Aliases:
+  usbboot on|now|status|doctor
+  nvmeboot on|now|status|doctor
+  restore status|all|usbboot|nvmeboot|verify|return|wizard|hostname|connect-auth
+
+Boot order values:
+  USB once:  0xf14 = USB first, then SD/eMMC fallback, then repeat
+  NVMe once: 0xf16 = NVMe first, then SD/eMMC fallback, then repeat
+
+Default behavior is verbose. Use --quiet only when you intentionally want less terminal output.
+USAGE
+}
+
+usage_restore() {
+  cat <<'USAGE'
+restore - restore bootonce tools and recovery settings into freshly flashed SD/eMMC
+
+Usage:
+  restore status [--target /dev/mmcblk0p2]
+  restore all [--yes] [--dry-run] [--quiet]
+  restore usbboot [--yes] [--dry-run] [--quiet]
+  restore nvmeboot [--yes] [--dry-run] [--quiet]
+  restore verify [--target /dev/mmcblk0p2]
+  restore return [--yes] [--dry-run] [--quiet]
+  restore wizard
+  restore hostname <hostname> [--yes] [--dry-run] [--quiet]
+  restore connect-auth [--key rpuak_xxxxx] [--user <user>] [--yes] [--dry-run] [--quiet]
+
+Safety:
+  By default restore targets /dev/mmcblk0p2 only.
+  It refuses USB/NVMe targets so you do not accidentally write to the recovery media.
+
+Default behavior is verbose and logs to /var/log/rpi-boot-once.log.
+USAGE
+}
+
+usage_alias_usb() {
+  cat <<'USAGE'
+usbboot - one-time Raspberry Pi 5 / CM5 USB boot override
+
+Usage:
+  usbboot on [--dry-run] [--yes] [--quiet]
+  usbboot now [--dry-run] [--yes] [--quiet]
+  usbboot status
+  usbboot doctor
+
+Meaning:
+  on  = set next boot to USB first, then SD/eMMC fallback. Does not reboot.
+  now = set next boot to USB first, then SD/eMMC fallback, then reboot.
+USAGE
+}
+
+usage_alias_nvme() {
+  cat <<'USAGE'
+nvmeboot - one-time Raspberry Pi 5 / CM5 NVMe boot override
+
+Usage:
+  nvmeboot on [--dry-run] [--yes] [--quiet]
+  nvmeboot now [--dry-run] [--yes] [--quiet]
+  nvmeboot status
+  nvmeboot doctor
+
+Meaning:
+  on  = set next boot to NVMe first, then SD/eMMC fallback. Does not reboot.
+  now = set next boot to NVMe first, then SD/eMMC fallback, then reboot.
+USAGE
+}
+
+parse_common_options() {
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --quiet) QUIET=1; shift ;;
+      --yes|-y) YES=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      --target)
+        [[ $# -ge 2 ]] || { error "--target requires a block device path"; exit 2; }
+        TARGET_ROOT="$2"; shift 2 ;;
+      --user)
+        [[ $# -ge 2 ]] || { error "--user requires a username"; exit 2; }
+        TARGET_USER="$2"; shift 2 ;;
+      --key)
+        [[ $# -ge 2 ]] || { error "--key requires an auth key value"; exit 2; }
+        CONNECT_KEY="$2"; shift 2 ;;
+      --help|-h)
+        positional+=("--help"); shift ;;
+      --)
+        shift
+        while [[ $# -gt 0 ]]; do positional+=("$1"); shift; done
+        ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  printf '%s\n' "${positional[@]}"
+}
+
+get_model() {
+  if [[ -r /proc/device-tree/model ]]; then
+    tr -d '\0' < /proc/device-tree/model 2>/dev/null || true
+  else
+    echo "unknown"
+  fi
+}
+
+get_compatible() {
+  if [[ -r /proc/device-tree/compatible ]]; then
+    tr '\0' '\n' < /proc/device-tree/compatible 2>/dev/null || true
+  fi
+}
+
+is_pi5_or_cm5() {
+  local model compatible combined
+  model="$(get_model)"
+  compatible="$(get_compatible)"
+  combined="$model $compatible"
+  grep -qiE 'Raspberry Pi 5|Compute Module 5|raspberrypi,5|brcm,bcm2712' <<< "$combined"
+}
+
+require_pi5_or_cm5() {
+  info "Checking Raspberry Pi model support"
+  local model
+  model="$(get_model)"
+  info "Detected model: $model"
+  if ! is_pi5_or_cm5; then
+    error "One-time boot override is only supported on Raspberry Pi 5 / CM5."
+    error "Detected model: $model"
+    error "No boot override was set."
+    exit 1
+  fi
+  ok "Model supports Pi 5 / CM5 one-time boot override"
+}
+
+find_vcmailbox() {
+  local p
+  if command -v vcmailbox >/dev/null 2>&1; then
+    command -v vcmailbox
+    return 0
+  fi
+  for p in /usr/bin/vcmailbox /bin/vcmailbox /opt/vc/bin/vcmailbox; do
+    [[ -x "$p" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+require_vcmailbox() {
+  info "Checking for vcmailbox"
+  local vcmb
+  if ! vcmb="$(find_vcmailbox)"; then
+    error "vcmailbox not found. Raspberry Pi firmware tools are missing or broken."
+    exit 1
+  fi
+  ok "Found vcmailbox: $vcmb"
+}
+
+current_root_source() { findmnt -no SOURCE / 2>/dev/null || true; }
+
+canonical_dev() {
+  local dev="$1"
+  readlink -f "$dev" 2>/dev/null || echo "$dev"
+}
+
+parent_disk() {
+  local dev="$1" pk=""
+  pk="$(lsblk -no PKNAME "$dev" 2>/dev/null | head -n1 || true)"
+  [[ -n "$pk" ]] && echo "/dev/$pk" || echo ""
+}
+
+booted_from_kind() {
+  local src parent tran
+  src="$(current_root_source)"
+  if [[ "$src" == PARTUUID=* || "$src" == UUID=* || "$src" == LABEL=* ]]; then
+    src="$(findmnt -no SOURCE / -o SOURCE 2>/dev/null || echo "$src")"
+  fi
+  if [[ "$src" == /dev/mmcblk* ]]; then echo "SD/eMMC"; return; fi
+  if [[ "$src" == /dev/nvme* ]]; then echo "NVMe"; return; fi
+  if [[ "$src" == /dev/sd* ]]; then echo "USB/SATA/SCSI"; return; fi
+  parent="$(parent_disk "$(canonical_dev "$src")")"
+  tran="$(lsblk -no TRAN "$parent" 2>/dev/null | head -n1 || true)"
+  case "$tran" in
+    usb) echo "USB" ;;
+    nvme) echo "NVMe" ;;
+    mmc) echo "SD/eMMC" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+eeprom_config_lines() {
+  if command -v rpi-eeprom-config >/dev/null 2>&1; then
+    rpi-eeprom-config 2>/dev/null | grep -E '^(BOOT_ORDER|PCIE_PROBE)=' || true
+  elif command -v vcgencmd >/dev/null 2>&1; then
+    vcgencmd bootloader_config 2>/dev/null | grep -E '^(BOOT_ORDER|PCIE_PROBE)=' || true
+  fi
+}
+
+show_status() {
+  info "Showing rpi-boot-once status"
+  local support
+  support="$(is_pi5_or_cm5 && echo yes || echo no)"
+  local lines=(
+    "Version:                   $VERSION"
+    "Model:                     $(get_model)"
+    "One-time override support: $support"
+    "Current root source:       $(current_root_source)"
+    "Booted from:               $(booted_from_kind)"
+    "Log file:                  $LOG_FILE"
+  )
+  local line
+  for line in "${lines[@]}"; do
+    log_line "INFO" "$line"
+    [[ "$QUIET" -eq 0 ]] && echo "$line"
+  done
+  [[ "$QUIET" -eq 0 ]] && echo
+  log_line "INFO" "Block devices:"
+  [[ "$QUIET" -eq 0 ]] && echo "Block devices:"
+  if [[ "$QUIET" -eq 0 ]]; then
+    lsblk -o NAME,PATH,TRAN,TYPE,FSTYPE,LABEL,SIZE,MOUNTPOINTS 2>&1 | tee -a "$LOG_FILE" || true
+  else
+    lsblk -o NAME,PATH,TRAN,TYPE,FSTYPE,LABEL,SIZE,MOUNTPOINTS >> "$LOG_FILE" 2>&1 || true
+  fi
+  [[ "$QUIET" -eq 0 ]] && echo
+  log_line "INFO" "Persistent EEPROM config:"
+  [[ "$QUIET" -eq 0 ]] && echo "Persistent EEPROM config:"
+  local cfg
+  cfg="$(eeprom_config_lines)"
+  if [[ -n "$cfg" ]]; then
+    if [[ "$QUIET" -eq 0 ]]; then echo "$cfg" | tee -a "$LOG_FILE"; else echo "$cfg" >> "$LOG_FILE"; fi
+  else
+    if [[ "$QUIET" -eq 0 ]]; then echo "BOOT_ORDER/PCIE_PROBE not readable or not present." | tee -a "$LOG_FILE"; else echo "BOOT_ORDER/PCIE_PROBE not readable or not present." >> "$LOG_FILE"; fi
+  fi
+}
+
+warn_if_usb_not_visible() {
+  info "Checking whether USB storage is visible in the running OS"
+  if lsblk -ndo TRAN,TYPE 2>/dev/null | awk '$1=="usb" && $2=="disk" {found=1} END{exit !found}'; then
+    ok "At least one USB storage disk is visible"
+  else
+    warn "No USB storage disk is visible. The next boot may fall back to SD/eMMC."
+    [[ "$YES" -eq 1 ]] || confirm "Continue setting USB one-time boot override anyway?"
+  fi
+}
+
+warn_if_nvme_not_visible() {
+  info "Checking whether NVMe storage is visible in the running OS"
+  if compgen -G '/dev/nvme*n*' >/dev/null 2>&1; then
+    ok "At least one NVMe device is visible"
+  else
+    warn "No NVMe device is visible. The next boot may fall back to SD/eMMC."
+    [[ "$YES" -eq 1 ]] || confirm "Continue setting NVMe one-time boot override anyway?"
+  fi
+}
+
+set_reboot_order() {
+  local target="$1" action="$2" order vcmb
+  case "$target" in
+    usb) order="$USB_ORDER" ;;
+    nvme) order="$NVME_ORDER" ;;
+    usb-strict) order="$USB_STRICT_ORDER" ;;
+    nvme-strict) order="$NVME_STRICT_ORDER" ;;
+    *) error "Internal error: unknown boot target $target"; exit 2 ;;
+  esac
+
+  need_root
+  require_pi5_or_cm5
+  require_vcmailbox
+  [[ "$target" == usb* ]] && warn_if_usb_not_visible
+  [[ "$target" == nvme* ]] && warn_if_nvme_not_visible
+
+  vcmb="$(find_vcmailbox)"
+  info "Setting one-time boot override"
+  info "Target: $target"
+  info "Order:  $order"
+  run_cmd "$vcmb" "$MAILBOX_TAG" 4 4 "$order"
+  ok "One-time boot override was set. It applies to the next boot attempt only."
+
+  if [[ "$action" == "now" ]]; then
+    info "Reboot requested by command"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      dry "Would reboot now"
+    else
+      run_cmd systemctl reboot
+    fi
+  else
+    ok "No reboot was requested. Run 'sudo reboot' when ready."
+  fi
+}
+
+is_mmc_partition() { [[ "$1" =~ ^/dev/mmcblk[0-9]+p[0-9]+$ ]]; }
+
+target_root() { canonical_dev "$TARGET_ROOT"; }
+
+target_mounted() { findmnt -rn "$MOUNTPOINT" >/dev/null 2>&1; }
+
+validate_target_root() {
+  local target current current_parent
+  target="$(target_root)"
+  info "Validating restore target"
+  info "Expected target root partition: $target"
+
+  if [[ ! -b "$target" ]]; then
+    error "Target root partition does not exist: $target"
+    error "Expected freshly flashed SD/eMMC root partition at /dev/mmcblk0p2."
+    exit 1
+  fi
+  if ! is_mmc_partition "$target"; then
+    error "Refusing target because it is not an mmcblk partition: $target"
+    error "Restore is intentionally limited to SD/eMMC, not USB/NVMe recovery media."
+    exit 1
+  fi
+
+  current="$(current_root_source)"
+  if [[ -n "$current" && "$current" == /dev/* ]]; then
+    current="$(canonical_dev "$current")"
+    current_parent="$(parent_disk "$current")"
+    if [[ "$current" == "$target" ]]; then
+      error "Target root is the currently running root filesystem: $target"
+      error "Refusing to modify the live root filesystem."
+      exit 1
+    fi
+    if [[ "$current_parent" == /dev/mmcblk* ]]; then
+      error "Current root appears to be on SD/eMMC: $current"
+      error "restore is meant to run from USB/NVMe recovery OS after flashing SD/eMMC."
+      exit 1
+    fi
+  fi
+  ok "Restore target passed safety checks"
+}
+
+mount_target() {
+  local target
+  target="$(target_root)"
+  validate_target_root
+  mkdir -p "$MOUNTPOINT"
+  if target_mounted; then
+    ok "Target is already mounted at $MOUNTPOINT"
+    return 0
+  fi
+  info "Mounting target root filesystem"
+  run_cmd mount "$target" "$MOUNTPOINT"
+  if [[ ! -d "$MOUNTPOINT/etc" || ! -d "$MOUNTPOINT/usr" ]]; then
+    error "Mounted target does not look like a Linux root filesystem."
+    run_cmd umount "$MOUNTPOINT" || true
+    exit 1
+  fi
+  ok "Mounted target root at $MOUNTPOINT"
+}
+
+unmount_target_if_mounted() {
+  if target_mounted; then
+    info "Unmounting target root filesystem"
+    run_cmd sync
+    run_cmd umount "$MOUNTPOINT"
+    ok "Target unmounted"
+  fi
+}
+
+preview_restore() {
+  local item="$1"
+  info "Restore preview"
+  echo "Target root partition: $(target_root)"
+  echo "Mount point:            $MOUNTPOINT"
+  echo "Current root:           $(current_root_source)"
+  echo "Requested restore:      $item"
+  case "$item" in
+    all) echo "Will install:           bootonce backend + usbboot + nvmeboot aliases" ;;
+    usbboot) echo "Will install:           bootonce backend + usbboot alias" ;;
+    nvmeboot) echo "Will install:           bootonce backend + nvmeboot alias" ;;
+  esac
+}
+
+install_boot_tool_aliases() {
+  local item="$1"
+  local source_backend="/usr/local/sbin/bootonce"
+  local target_sbin="$MOUNTPOINT/usr/local/sbin"
+
+  [[ -x "$source_backend" ]] || { error "Source backend not executable: $source_backend"; exit 1; }
+
+  info "Installing bootonce backend into target"
+  run_cmd install -D -m 0755 "$source_backend" "$target_sbin/bootonce"
+
+  case "$item" in
+    all|usbboot)
+      info "Creating usbboot alias in target"
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        dry "Would create symlink $target_sbin/usbboot -> bootonce"
+      else
+        ln -sf bootonce "$target_sbin/usbboot"
+        ok "Created alias: $target_sbin/usbboot -> bootonce"
+        log_line "OK" "Created alias: $target_sbin/usbboot -> bootonce"
+      fi
+      ;;&
+    all|nvmeboot)
+      info "Creating nvmeboot alias in target"
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        dry "Would create symlink $target_sbin/nvmeboot -> bootonce"
+      else
+        ln -sf bootonce "$target_sbin/nvmeboot"
+        ok "Created alias: $target_sbin/nvmeboot -> bootonce"
+        log_line "OK" "Created alias: $target_sbin/nvmeboot -> bootonce"
+      fi
+      ;;
+  esac
+
+  info "Writing recovery marker documentation"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    dry "Would write $MOUNTPOINT/usr/share/doc/usbboot-temp-override/RESTORED_FROM_RECOVERY.txt"
+  else
+    mkdir -p "$MOUNTPOINT/usr/share/doc/usbboot-temp-override"
+    cat > "$MOUNTPOINT/usr/share/doc/usbboot-temp-override/RESTORED_FROM_RECOVERY.txt" <<'RESTORED'
+rpi-boot-once tools were restored into this system by the recovery OS.
+The command files were copied directly to /usr/local/sbin.
+This is enough for usbboot/nvmeboot/bootonce commands to work after reboot,
+even if dpkg does not list this package as installed in the target OS.
+RESTORED
+    ok "Wrote recovery marker documentation"
+  fi
+}
+
+restore_tools() {
+  local item="$1"
+  need_root
+  preview_restore "$item"
+  confirm "Apply this restore operation to SD/eMMC?"
+  mount_target
+  install_boot_tool_aliases "$item"
+  run_cmd sync
+  unmount_target_if_mounted
+  ok "Restore operation finished: $item"
+}
+
+restore_status() {
+  info "Showing restore status"
+  echo "Default target root:     $DEFAULT_TARGET_ROOT"
+  echo "Selected target root:    $(target_root)"
+  echo "Mount point:             $MOUNTPOINT"
+  echo "Current root source:     $(current_root_source)"
+  echo "Booted from:             $(booted_from_kind)"
+  echo
+  echo "Block devices:"
+  lsblk -o NAME,PATH,TRAN,TYPE,FSTYPE,LABEL,SIZE,MOUNTPOINTS 2>&1 | tee -a "$LOG_FILE" || true
+}
+
+restore_verify() {
+  need_root
+  info "Verifying restored bootonce tools on SD/eMMC target"
+  mount_target
+  local ok_count=0 fail_count=0
+  local paths=("$MOUNTPOINT/usr/local/sbin/bootonce" "$MOUNTPOINT/usr/local/sbin/usbboot" "$MOUNTPOINT/usr/local/sbin/nvmeboot")
+  local p
+  for p in "${paths[@]}"; do
+    if [[ -e "$p" ]]; then
+      ok "Exists: $p"
+      ((ok_count++)) || true
+    else
+      error "Missing: $p"
+      ((fail_count++)) || true
+    fi
+  done
+  if [[ -x "$MOUNTPOINT/usr/local/sbin/bootonce" ]]; then
+    ok "Executable: $MOUNTPOINT/usr/local/sbin/bootonce"
+  else
+    error "Not executable: $MOUNTPOINT/usr/local/sbin/bootonce"
+    ((fail_count++)) || true
+  fi
+  run_cmd sync
+  unmount_target_if_mounted
+  if [[ "$fail_count" -gt 0 ]]; then
+    error "Verification failed with $fail_count problem(s)."
+    exit 1
+  fi
+  ok "Verification succeeded"
+}
+
+restore_return() {
+  need_root
+  info "Starting restore return workflow"
+  restore_tools "all"
+  restore_verify
+  info "Syncing disks before reboot"
+  run_cmd sync
+  unmount_target_if_mounted
+  info "Rebooting back to normal SD/eMMC boot order"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    dry "Would reboot now"
+  else
+    run_cmd systemctl reboot
+  fi
+}
+
+validate_hostname() {
+  local h="$1"
+  [[ ${#h} -ge 1 && ${#h} -le 63 ]] || return 1
+  [[ "$h" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+}
+
+set_target_hostname() {
+  local hostname="$1"
+  need_root
+  if ! validate_hostname "$hostname"; then
+    error "Invalid hostname: $hostname"
+    error "Use lowercase letters, numbers and hyphens only. No spaces or underscores."
+    exit 1
+  fi
+  info "Hostname preview"
+  echo "Target root: $(target_root)"
+  echo "New hostname: $hostname"
+  confirm "Set this hostname on SD/eMMC?"
+  mount_target
+  info "Writing /etc/hostname in target"
+  write_file "$MOUNTPOINT/etc/hostname" "$hostname
+"
+
+  info "Updating /etc/hosts in target"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    dry "Would update 127.0.1.1 entry in $MOUNTPOINT/etc/hosts"
+  else
+    touch "$MOUNTPOINT/etc/hosts"
+    if grep -qE '^127\.0\.1\.1[[:space:]]+' "$MOUNTPOINT/etc/hosts"; then
+      sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$hostname/" "$MOUNTPOINT/etc/hosts"
+    else
+      printf '127.0.1.1\t%s\n' "$hostname" >> "$MOUNTPOINT/etc/hosts"
+    fi
+    ok "Updated target /etc/hosts"
+  fi
+  run_cmd sync
+  unmount_target_if_mounted
+  ok "Hostname setup finished"
+}
+
+autodetect_target_user() {
+  local passwd="$MOUNTPOINT/etc/passwd"
+  [[ -r "$passwd" ]] || return 1
+  awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ {print $1; exit}' "$passwd"
+}
+
+user_home_uid_gid() {
+  local user="$1" passwd="$MOUNTPOINT/etc/passwd"
+  awk -F: -v u="$user" '$1==u {print $6":"$3":"$4; exit}' "$passwd"
+}
+
+read_secret_prompt() {
+  local prompt="$1" out=""
+  printf '%s: ' "$prompt" >&2
+  if [[ -t 0 ]]; then
+    stty -echo || true
+    read -r out || true
+    stty echo || true
+    printf '\n' >&2
+  else
+    read -r out || true
+  fi
+  printf '%s' "$out"
+}
+
+inject_connect_auth() {
+  local key="${1:-$CONNECT_KEY}" user="${TARGET_USER:-}" info_line home uid gid rel_home key_dir key_file
+  need_root
+  mount_target
+
+  if [[ -z "$user" ]]; then
+    user="$(autodetect_target_user || true)"
+    [[ -n "$user" ]] || { error "Could not auto-detect target user. Use --user <user>."; exit 1; }
+    ok "Auto-detected target user: $user"
+  else
+    info "Using requested target user: $user"
+  fi
+
+  info_line="$(user_home_uid_gid "$user" || true)"
+  [[ -n "$info_line" ]] || { error "User not found in target /etc/passwd: $user"; exit 1; }
+  home="${info_line%%:*}"
+  uid="${info_line#*:}"; uid="${uid%%:*}"
+  gid="${info_line##*:}"
+
+  if [[ -z "$key" ]]; then
+    key="$(read_secret_prompt "Raspberry Pi Connect auth key")"
+  fi
+  [[ -n "$key" ]] || { error "No Raspberry Pi Connect auth key provided."; exit 1; }
+
+  rel_home="${home#/}"
+  key_dir="$MOUNTPOINT/$rel_home/.config/com.raspberrypi.connect"
+  key_file="$key_dir/auth.key"
+
+  info "Raspberry Pi Connect auth key injection preview"
+  echo "Target user:       $user"
+  echo "Target home:       $home"
+  echo "Target key path:   $home/.config/com.raspberrypi.connect/auth.key"
+  echo "Auth key:          $(redact_key "$key")"
+  confirm "Write Raspberry Pi Connect auth key into SD/eMMC target?"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    dry "Would create $key_dir"
+    dry "Would write redacted auth key to $key_file"
+    dry "Would chown to $uid:$gid and chmod 600"
+  else
+    mkdir -p "$key_dir"
+    printf '%s\n' "$key" > "$key_file"
+    chown -R "$uid:$gid" "$MOUNTPOINT/$rel_home/.config"
+    chmod 700 "$MOUNTPOINT/$rel_home/.config" "$MOUNTPOINT/$rel_home/.config/com.raspberrypi.connect"
+    chmod 600 "$key_file"
+    ok "Auth key written to target path with chmod 600"
+    log_line "OK" "Auth key written to $home/.config/com.raspberrypi.connect/auth.key value=$(redact_key "$key")"
+  fi
+  run_cmd sync
+  unmount_target_if_mounted
+}
+
+configure_network_static_nm() {
+  local iface="$1" ipcidr="$2" gw="$3" dns="$4" file="$MOUNTPOINT/etc/NetworkManager/system-connections/rpi-boot-once-static-$iface.nmconnection"
+  info "Configuring static IPv4 using NetworkManager"
+  path_note "$file"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    dry "Would write NetworkManager static profile"
+    return 0
+  fi
+  mkdir -p "$(dirname "$file")"
+  cat > "$file" <<EOF_NM
+[connection]
+id=rpi-boot-once-static-$iface
+type=ethernet
+interface-name=$iface
+autoconnect=true
+
+[ipv4]
+method=manual
+address1=$ipcidr,$gw
+dns=$dns;
+
+[ipv6]
+method=auto
+EOF_NM
+  chmod 600 "$file"
+  ok "NetworkManager static profile written"
+}
+
+configure_network_static_dhcpcd() {
+  local iface="$1" ipcidr="$2" gw="$3" dns="$4" file="$MOUNTPOINT/etc/dhcpcd.conf"
+  info "Configuring static IPv4 using dhcpcd.conf"
+  path_note "$file"
+  append_file "$file" "
+# Added by rpi-boot-once restore wizard
+interface $iface
+static ip_address=$ipcidr
+static routers=$gw
+static domain_name_servers=$dns
+"
+}
+
+wizard_network() {
+  local mode iface ipcidr gw dns
+  echo
+  echo "Network mode:"
+  echo "1) DHCP / leave unchanged"
+  echo "2) Static IPv4"
+  printf 'Choose [1]: '
+  read -r mode || true
+  mode="${mode:-1}"
+  if [[ "$mode" != "2" ]]; then
+    ok "Network left as DHCP / unchanged"
+    return 0
+  fi
+  printf 'Interface [eth0]: '; read -r iface || true; iface="${iface:-eth0}"
+  printf 'Static IPv4 with CIDR, example 192.168.1.50/24: '; read -r ipcidr || true
+  printf 'Gateway, example 192.168.1.1: '; read -r gw || true
+  printf 'DNS, example 1.1.1.1 8.8.8.8: '; read -r dns || true
+  [[ -n "$ipcidr" && -n "$gw" && -n "$dns" ]] || { error "Static network settings incomplete"; exit 1; }
+
+  mount_target
+  if [[ -d "$MOUNTPOINT/etc/NetworkManager" ]]; then
+    configure_network_static_nm "$iface" "$ipcidr" "$gw" "$dns"
+  elif [[ -f "$MOUNTPOINT/etc/dhcpcd.conf" ]]; then
+    configure_network_static_dhcpcd "$iface" "$ipcidr" "$gw" "$dns"
+  else
+    warn "Could not safely detect NetworkManager or dhcpcd in target OS. Leaving network unchanged."
+  fi
+}
+
+restore_wizard() {
+  need_root
+  local hostname="" key="" restore_tools_answer="" reboot_answer="" user=""
+  info "Starting interactive restore wizard"
+  restore_status
+  echo
+  printf 'Hostname to set on SD/eMMC, blank to skip: '
+  read -r hostname || true
+  if [[ -n "$hostname" ]]; then
+    if ! validate_hostname "$hostname"; then
+      error "Invalid hostname: $hostname"
+      exit 1
+    fi
+  fi
+  printf 'Target user for Raspberry Pi Connect auth key, blank for auto-detect: '
+  read -r user || true
+  key="$(read_secret_prompt 'Raspberry Pi Connect auth key, blank to skip')"
+  printf 'Restore bootonce tools? [Y/n]: '
+  read -r restore_tools_answer || true
+  restore_tools_answer="${restore_tools_answer:-Y}"
+
+  info "Wizard summary"
+  echo "Target root:          $(target_root)"
+  echo "Hostname:             ${hostname:-skip}"
+  echo "Connect target user:  ${user:-auto-detect}"
+  if [[ -n "$key" ]]; then
+    echo "Connect auth key:     $(redact_key "$key")"
+  else
+    echo "Connect auth key:     skip"
+  fi
+  echo "Restore boot tools:   $restore_tools_answer"
+  echo "Network:              asked next, DHCP default"
+  confirm "Continue with wizard changes?"
+
+  mount_target
+  if [[ -n "$hostname" ]]; then
+    TARGET_ROOT="$(target_root)" YES=1 set_target_hostname "$hostname"
+  fi
+  if [[ -n "$key" ]]; then
+    TARGET_USER="$user" CONNECT_KEY="$key" YES=1 inject_connect_auth "$key"
+  fi
+  if [[ "$restore_tools_answer" =~ ^[Yy] ]]; then
+    YES=1 restore_tools "all"
+  fi
+  wizard_network
+  restore_verify
+
+  printf 'Reboot back to SD/eMMC now? [y/N]: '
+  read -r reboot_answer || true
+  if [[ "$reboot_answer" =~ ^[Yy] ]]; then
+    info "User requested reboot from wizard"
+    run_cmd sync
+    unmount_target_if_mounted
+    if [[ "$DRY_RUN" -eq 1 ]]; then dry "Would reboot now"; else run_cmd systemctl reboot; fi
+  else
+    ok "Wizard finished without reboot"
+  fi
+}
+
+bootonce_doctor() {
+  info "Running rpi-boot-once doctor"
+  show_status
+  echo
+  info "Checking required commands"
+  local cmd missing=0
+  for cmd in bash findmnt lsblk mount umount sync sed awk grep install ln; do
+    if command -v "$cmd" >/dev/null 2>&1; then ok "Found command: $cmd"; else error "Missing command: $cmd"; missing=1; fi
+  done
+  if find_vcmailbox >/dev/null 2>&1; then ok "Found vcmailbox: $(find_vcmailbox)"; else error "Missing vcmailbox"; missing=1; fi
+  if is_pi5_or_cm5; then ok "Pi 5 / CM5 model check passed"; else error "Pi 5 / CM5 model check failed"; missing=1; fi
+  info "Checking restore target visibility"
+  if [[ -b "$(target_root)" ]]; then ok "Restore target exists: $(target_root)"; else warn "Restore target not found: $(target_root)"; fi
+  if [[ "$missing" -eq 0 ]]; then ok "Doctor finished without critical problems"; else error "Doctor found critical problem(s)"; exit 1; fi
+}
+
+dispatch_bootonce() {
+  local args=()
+  mapfile -t args < <(parse_common_options "$@")
+  [[ ${#args[@]} -gt 0 ]] || { usage_bootonce; exit 0; }
+  case "${args[0]}" in
+    status) show_status ;;
+    doctor) bootonce_doctor ;;
+    usb)
+      [[ ${#args[@]} -ge 2 ]] || { error "Missing usb action: on or now"; exit 2; }
+      case "${args[1]}" in on|now) set_reboot_order usb "${args[1]}" ;; *) error "Unknown usb action: ${args[1]}"; exit 2 ;; esac ;;
+    nvme)
+      [[ ${#args[@]} -ge 2 ]] || { error "Missing nvme action: on or now"; exit 2; }
+      case "${args[1]}" in on|now) set_reboot_order nvme "${args[1]}" ;; *) error "Unknown nvme action: ${args[1]}"; exit 2 ;; esac ;;
+    --help|help|-h) usage_bootonce ;;
+    *) error "Unknown bootonce command: ${args[0]}"; usage_bootonce; exit 2 ;;
+  esac
+}
+
+dispatch_usbboot() {
+  local args=()
+  mapfile -t args < <(parse_common_options "$@")
+  [[ ${#args[@]} -gt 0 ]] || { usage_alias_usb; exit 0; }
+  case "${args[0]}" in
+    on|now) set_reboot_order usb "${args[0]}" ;;
+    status) show_status ;;
+    doctor) bootonce_doctor ;;
+    --help|help|-h) usage_alias_usb ;;
+    *) error "Unknown usbboot command: ${args[0]}"; usage_alias_usb; exit 2 ;;
+  esac
+}
+
+dispatch_nvmeboot() {
+  local args=()
+  mapfile -t args < <(parse_common_options "$@")
+  [[ ${#args[@]} -gt 0 ]] || { usage_alias_nvme; exit 0; }
+  case "${args[0]}" in
+    on|now) set_reboot_order nvme "${args[0]}" ;;
+    status) show_status ;;
+    doctor) bootonce_doctor ;;
+    --help|help|-h) usage_alias_nvme ;;
+    *) error "Unknown nvmeboot command: ${args[0]}"; usage_alias_nvme; exit 2 ;;
+  esac
+}
+
+dispatch_restore() {
+  local args=()
+  mapfile -t args < <(parse_common_options "$@")
+  [[ ${#args[@]} -gt 0 ]] || { usage_restore; exit 0; }
+  case "${args[0]}" in
+    status) restore_status ;;
+    all|usbboot|nvmeboot) restore_tools "${args[0]}" ;;
+    verify) restore_verify ;;
+    return) restore_return ;;
+    wizard|setup) restore_wizard ;;
+    hostname)
+      [[ ${#args[@]} -ge 2 ]] || { error "Missing hostname value"; exit 2; }
+      set_target_hostname "${args[1]}" ;;
+    connect-auth)
+      inject_connect_auth "${CONNECT_KEY:-}" ;;
+    --help|help|-h) usage_restore ;;
+    *) error "Unknown restore command: ${args[0]}"; usage_restore; exit 2 ;;
+  esac
+}
+
+main() {
+  init_log
+  log_line "INFO" "Command started: $PROGRAM_NAME $*"
+  case "$PROGRAM_NAME" in
+    bootonce) dispatch_bootonce "$@" ;;
+    usbboot) dispatch_usbboot "$@" ;;
+    nvmeboot) dispatch_nvmeboot "$@" ;;
+    restore|rpi-boot-restore) dispatch_restore "$@" ;;
+    *) dispatch_bootonce "$@" ;;
+  esac
+  log_line "INFO" "Command finished: $PROGRAM_NAME $*"
+}
+
+main "$@"
