@@ -91,6 +91,18 @@ Shrink an existing image later:
 sudo bootonce makeimage pishrink
 ```
 
+## Install from GitHub
+
+```bash
+cd /tmp
+
+wget https://github.com/fishieststick/bootonce/releases/download/v1.5.3/bootonce_1.5.3_all.deb
+wget https://github.com/fishieststick/bootonce/releases/download/v1.5.3/bootonce_1.5.3_SHA256SUMS.txt
+
+sha256sum -c bootonce_1.5.3_SHA256SUMS.txt --ignore-missing
+
+sudo apt install ./bootonce_1.5.3_all.deb
+
 ## Design rules
 
 - one public command: `bootonce`
