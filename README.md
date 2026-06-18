@@ -1,16 +1,12 @@
 # bootonce
 
-`bootonce` is a small Raspberry Pi 5 and Compute Module 5 recovery helper.
+`bootonce` is a lightweight Raspberry Pi 5 and Compute Module 5 recovery helper.
 
-## Why this exists
+It was built for field recovery workflows where a technician needs to boot once into a USB or NVMe recovery OS, repair or reflash the internal OS, and then return to the normal boot path without permanently changing the EEPROM boot order.
 
-`bootonce` was built for Raspberry Pi 5 and CM5 field recovery.
+## What it does
 
-The goal is to let a technician boot once into a USB or NVMe recovery OS, repair or reflash the internal OS, and then return to the normal boot path without permanently changing the EEPROM boot order.
-
-This is especially useful for CM5 systems with eMMC, remote Raspberry Pi Connect access, and recovery USB images.
-
-It gives technicians one short command interface for:
+`bootonce` provides one short command interface for:
 
 * one-time USB boot override
 * one-time NVMe boot override
@@ -21,6 +17,20 @@ It gives technicians one short command interface for:
 * optional PiShrink post-processing
 
 The tool is intentionally verbose by default. It prints what it is doing, which command or path is affected, and whether each step succeeded or failed.
+
+## Why this exists
+
+`bootonce` was built for Raspberry Pi 5 and CM5 field recovery.
+
+The main goal is simple:
+
+1. Boot the normal OS.
+2. Set a one-time USB or NVMe recovery boot.
+3. Reboot manually.
+4. Repair, reflash, image, or prepare the internal OS from the recovery OS.
+5. Reboot again and return to the normal boot path.
+
+This is especially useful for CM5 systems with eMMC, remote Raspberry Pi Connect access, and recovery USB images.
 
 ## Supported devices
 
@@ -33,6 +43,30 @@ The tool is intentionally verbose by default. It prints what it is doing, which 
 * Raspberry Pi Compute Module 4
 
 Raspberry Pi 4 and Compute Module 4 do not support the same clean Raspberry Pi 5 style one-time boot order override used by this tool.
+
+## Lightweight by design
+
+`bootonce` is intentionally small and boring.
+
+It is a single Bash script packaged as a `.deb`.
+
+It does not use:
+
+* Python
+* Node.js
+* Docker
+* a database
+* a web server
+* a background management service
+* a custom daemon
+
+It relies on standard Raspberry Pi OS and Linux tools instead.
+
+The package declares normal system dependencies such as Bash, coreutils, util-linux, systemd, awk, grep, sed, findutils, and wget or curl. These are already present on most Raspberry Pi OS installations.
+
+PiShrink is optional. If PiShrink is missing, `bootonce` can recheck, ask for a manual path, skip shrinking, or download PiShrink from the official Drewsif/PiShrink GitHub source when the user explicitly chooses that option.
+
+Raspberry Pi Connect support requires Raspberry Pi Connect to be present in the target OS. `bootonce connect` prepares the offline OS for Connect sign-in, but it is not meant to replace the Raspberry Pi Connect package itself.
 
 ## Install from GitHub Release
 
@@ -88,7 +122,7 @@ sudo bootonce makeimage pishrink    Shrink an existing .img with PiShrink
 
 `bootonce connect` prepares an offline Raspberry Pi OS installation for Raspberry Pi Connect.
 
-This is useful when you are booted into a recovery OS and want to prepare another OS installation, for example an eMMC installation or USB recovery installation, before booting into it.
+This is useful when you are booted into one OS, for example a recovery USB system, and want to prepare another OS installation, for example eMMC, before booting into it.
 
 `bootonce connect` can configure:
 
@@ -124,6 +158,7 @@ Important behavior:
 * personal auth keys expire after 6 hours
 * organisation auth keys can expire between 1 and 90 days
 * personal accounts can only have one active auth key at a time
+* organisations can have multiple active auth keys
 * each device or prepared OS install needs its own unused auth key
 * the target Raspberry Pi must boot and reach the internet before the key expires
 
@@ -133,20 +168,25 @@ Because of this, generate the auth key shortly before running `bootonce connect`
 
 1. Open Raspberry Pi Connect in your browser.
 2. Sign in with your Raspberry Pi ID.
-3. Open the account menu or settings area.
-4. For a personal account, go to the Settings tab.
-5. Find the Auth keys section.
-6. Select Create new auth key.
-7. Copy the generated key.
-8. Paste it into `bootonce connect` when asked.
+3. Select your personal account or organisation.
+4. For a personal account, open the Settings tab.
+5. For an organisation, open the Provisioning tab.
+6. Find the Auth keys section.
+7. Create a new auth key.
+8. Copy the generated key.
+9. Paste it into `bootonce connect` when asked.
 
-The key usually starts with something like:
+Personal auth keys usually start with:
 
 ```text
 rpuak_
 ```
 
-Organisation keys may use a different prefix.
+Organisation auth keys may use a different prefix, for example:
+
+```text
+rpoak_
+```
 
 When `bootonce connect` asks for the auth key, the input is intentionally visible. This makes it easier for a technician to verify that the copied key is complete. The key is still redacted in logs and summaries.
 
@@ -158,40 +198,103 @@ Raspberry Pi Connect can automatically detect an auth key if it is saved inside 
 .config/com.raspberrypi.connect/auth.key
 ```
 
-`bootonce connect` prepares the selected offline OS so that Raspberry Pi Connect can consume the auth key when that OS is booted.
+`bootonce connect` writes the key into the selected offline OS so that Raspberry Pi Connect can consume it when that OS boots.
 
-After the target OS boots and reaches the internet, Raspberry Pi Connect exchanges the auth key for a persistent sign-in token. The original auth key is then no longer reusable.
+After the target OS boots and reaches the internet, Raspberry Pi Connect exchanges the auth key for a persistent sign-in token. The original auth key is then consumed and cannot be reused.
 
 If the target OS does not boot and connect to the internet before the auth key expires, create a new auth key and run `bootonce connect` again.
 
-## Typical workflow
+## Example field workflow: CM5 eMMC with USB recovery OS
 
-### Prepare USB recovery OS from eMMC
+This is the workflow `bootonce` was originally designed for.
 
-Boot into the normal eMMC OS, then run:
+### Situation
+
+* CM5 has the normal operating system on eMMC.
+* A USB stick contains a Raspberry Pi OS recovery system.
+* The technician wants remote recovery access through Raspberry Pi Connect.
+* The technician wants to boot into USB once, work on eMMC, then return to normal eMMC boot.
+
+### Step 1: Boot normal eMMC OS
+
+Boot the CM5 normally from eMMC.
+
+Install `bootonce` if it is not already installed:
 
 ```bash
-sudo bootonce connect
+cd /tmp
+
+wget https://github.com/fishieststick/bootonce/releases/download/v1.5.3/bootonce_1.5.3_all.deb
+wget https://github.com/fishieststick/bootonce/releases/download/v1.5.3/bootonce_1.5.3_SHA256SUMS.txt
+
+sha256sum -c bootonce_1.5.3_SHA256SUMS.txt --ignore-missing
+
+sudo apt install ./bootonce_1.5.3_all.deb
+```
+
+Check it:
+
+```bash
+sudo bootonce version
+sudo bootonce doctor
+```
+
+### Step 2: Prepare the USB recovery OS
+
+Create a fresh Raspberry Pi Connect auth key for the USB recovery OS.
+
+Then run:
+
+```bash
+sudo bootonce connect usb
+```
+
+During the wizard:
+
+* select or confirm the USB target
+* set the recovery hostname
+* paste the fresh Raspberry Pi Connect auth key
+* choose DHCP or configure static networking
+* optionally configure VLAN
+
+Then restore `bootonce` into the USB recovery OS:
+
+```bash
 sudo bootonce restore
+```
+
+Select the USB OS when asked.
+
+### Step 3: Boot once into USB recovery
+
+Set the one-time USB boot override:
+
+```bash
 sudo bootonce usb on
-sudo reboot
 ```
 
-The next boot goes to USB once. After that, the normal boot order is used again.
-
-### Prepare eMMC from USB recovery OS
-
-Boot into the USB recovery OS, then run:
+Then reboot manually:
 
 ```bash
-sudo bootonce connect
-sudo bootonce restore
 sudo reboot
 ```
 
-### Create an image
+The next boot goes to USB once. The normal EEPROM boot order is not permanently changed.
 
-Example for eMMC:
+### Step 4: Work from the USB recovery OS
+
+After the USB recovery OS boots and reaches the internet, it should appear in Raspberry Pi Connect.
+
+From the USB recovery OS, the technician can now:
+
+* inspect the eMMC OS
+* repair files
+* reflash eMMC
+* restore `bootonce` into eMMC
+* prepare Raspberry Pi Connect for eMMC
+* create a backup image
+
+Example image command:
 
 ```bash
 sudo bootonce makeimage emmc
@@ -199,13 +302,64 @@ sudo bootonce makeimage emmc
 
 After the raw image is created, `bootonce` asks whether PiShrink should be used.
 
-### Shrink an existing image later
+If PiShrink is missing, `bootonce` can:
+
+* recheck
+* ask for a manual path
+* skip shrinking
+* download PiShrink from GitHub if the technician chooses that option
+
+### Step 5: Prepare the eMMC OS again
+
+If eMMC was reflashed or repaired, create a fresh Raspberry Pi Connect auth key for the eMMC OS.
+
+Then run:
+
+```bash
+sudo bootonce connect emmc
+```
+
+Restore `bootonce` into the eMMC OS:
+
+```bash
+sudo bootonce restore
+```
+
+Select the eMMC OS when asked.
+
+### Step 6: Return to normal boot
+
+Reboot manually:
+
+```bash
+sudo reboot
+```
+
+Because the USB boot was only a one-time override, the device should return to its normal boot path after the recovery boot is finished.
+
+If the eMMC OS was prepared with a valid Connect auth key and reaches the internet before the key expires, it should appear in Raspberry Pi Connect.
+
+## Imaging
+
+`bootonce` can create raw images from detected storage devices.
+
+Examples:
+
+```bash
+sudo bootonce makeimage emmc
+sudo bootonce makeimage usb
+sudo bootonce makeimage nvme
+```
+
+The tool refuses to image or modify the currently running root filesystem.
+
+After creating an image, `bootonce` can optionally run PiShrink.
+
+To shrink an existing image later:
 
 ```bash
 sudo bootonce makeimage pishrink
 ```
-
-If PiShrink is missing, `bootonce` can recheck, ask for a manual path, skip shrinking, or download PiShrink from the official Drewsif/PiShrink GitHub source.
 
 ## Design goals
 
@@ -236,6 +390,12 @@ A release should include:
 bootonce_1.5.3_all.deb
 bootonce_1.5.3_SHA256SUMS.txt
 ```
+
+## Project status
+
+`bootonce` is field-tested on a real CM5 recovery workflow, but it is still a small early-stage tool.
+
+Test carefully before using it in production environments.
 
 ## License
 
