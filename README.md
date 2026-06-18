@@ -2,6 +2,14 @@
 
 `bootonce` is a small Raspberry Pi 5 and Compute Module 5 recovery helper.
 
+## Why this exists
+
+`bootonce` was built for Raspberry Pi 5 and CM5 field recovery.
+
+The goal is to let a technician boot once into a USB or NVMe recovery OS, repair or reflash the internal OS, and then return to the normal boot path without permanently changing the EEPROM boot order.
+
+This is especially useful for CM5 systems with eMMC, remote Raspberry Pi Connect access, and recovery USB images.
+
 It gives technicians one short command interface for:
 
 * one-time USB boot override
